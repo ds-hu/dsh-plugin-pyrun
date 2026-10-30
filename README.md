@@ -126,6 +126,7 @@ Cannot read properties of undefined (reading 'prepare')
 - **cordis 的两处分工**：`peerDependencies` 声明 `^4.0.1`（非 `dsh-*` 名，不参与版本闸门；运行实例由宿主提供）；`devDependencies` 精确锁定 `4.0.5-alpha.1`——这是 0.2.1-alpha.1 harness 家族自己钉的 cordis（npm dist-tag `dsh-0-2-1-alpha-1`），本地 dev 副本 `dsh-tools` / `dsh-sandbox` 在模块加载时就要 `import { Service } from '@deepseek-ai/cordis'`，而 `link:` 安装路径实际运行的就是这份本地副本，钉齐可避免本地树出现版本漂移。消费方 profile 永不安装 devDependencies，一律按 `package.json` 的 peer 处理。
 - **测试**：`pnpm test`（`node --test test/`）。在本 DSH 沙箱内 `node --test test/` 会因 piped-stdio spawn 被沙箱拒绝（`spawn EPERM`，沙箱边界而非测试失败），此时改用 `node test/manifest.test.mjs` 或 `node --test --test-isolation=none "test/*.test.mjs"`。
 - **不依赖 `@deepseek-ai/dsh-llm`**：`HarnessError` 只在 `errorInfo()` 的 `instanceof` 判定里被识别，而进程内插件拿到的是另一份独立拷贝，`instanceof` 必为假——与其静默退化，不如根本不走那条路（取消由运行时的规范通道处理）。
+- **图标**：`icon.svg`（64×64 瓦片，与同机其他第三方插件同形）由 `package.json.icon` 声明，并**必须**同时写进 `files`。Plugins 页经 `exports["./package.json"]` 读清单、把该文件内联成 data URL（`app-boot` 的 `readPluginMeta`：相对路径且留在包目录内，SVG/PNG/JPEG/WebP，≤256 KiB）；少任一半，行上只会显示默认图或一条元信息错误。改图标需重装（`github:` 安装读的是 profile 里那份副本）后重启才可见。`test/manifest.test.mjs` 守着这条链。
 - **改宿主半身 → 重启 `dsh`**；改 `cordis.patch.yml` 可由 `patchReload: live` 生效。
 - 重装/更新：重复执行上面的 `dsh plugin --profile web add ...`。
 

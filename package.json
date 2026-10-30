@@ -1,6 +1,7 @@
 {
   "name": "dsh-plugin-pyrun",
   "version": "0.1.0",
+  "icon": "./icon.svg",
   "private": true,
   "license": "MIT",
   "repository": {
@@ -18,6 +19,7 @@
     "./package.json": "./package.json"
   },
   "files": [
+    "icon.svg",
     "src",
     "cordis.patch.yml",
     "README.md",

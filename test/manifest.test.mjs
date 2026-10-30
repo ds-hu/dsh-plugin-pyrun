@@ -23,7 +23,7 @@
  */
 
 import assert from 'node:assert/strict'
-import { readFile } from 'node:fs/promises'
+import { readFile, stat } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
@@ -118,4 +118,38 @@ test('the local dev copies are pinned inside the declared contract', () => {
       `${name} dev pin ${devPin} falls outside the declared peer range ${manifest.peerDependencies[name]}`,
     )
   }
+})
+
+test('the Plugins page icon is declared, shipped, and self-contained', async () => {
+  // app-boot's readPluginMeta paints the Plugins row from `package.json.icon`:
+  // it resolves ./package.json through the package's own exports, treats the
+  // icon path as relative to the manifest directory, and embeds the bytes as a
+  // data URL (SVG/PNG/JPEG/WebP, at most 256 KiB). Every half of that chain
+  // fails quietly — a path missing from `files` is not in the tarball the
+  // consumer installs, so the row shows a metadata error instead of artwork.
+  const declared = manifest.icon?.replace(/^\.\//, '')
+  assert.ok(declared !== undefined, 'package.json must declare `icon`: without it the row draws the default artwork')
+  assert.ok(
+    !declared.startsWith('/') && !/^[A-Za-z]:/.test(declared) && !declared.includes('..'),
+    `icon must be a relative path inside the manifest directory (got ${manifest.icon})`,
+  )
+  assert.ok(
+    manifest.exports?.['./package.json'] !== undefined,
+    'the manifest must stay exported: readPluginMeta resolves ./package.json through exports to reach the icon field at all',
+  )
+  assert.ok(
+    manifest.files.includes(declared),
+    `${declared} must be listed in files: the consumer installs the packed package, so a file left out ships as a dangling icon path`,
+  )
+
+  const file = join(root, declared)
+  const [svg, { size }] = await Promise.all([readFile(file, 'utf8'), stat(file)])
+  assert.ok(size > 0 && size <= 256 * 1024, `icon must be within the 256 KiB the host admits (got ${size} bytes)`)
+  assert.match(svg, /^<svg[\s>]/, `${declared} must be an SVG document`)
+  assert.match(svg, /viewBox="0 0 64 64"/, `${declared} is drawn on the 64-unit tile the sibling plugins use`)
+  assert.doesNotMatch(
+    svg,
+    /<script|href="(?:https?:)?\/\//,
+    `${declared} is embedded as a data: URL, where nothing external can load`,
+  )
 })

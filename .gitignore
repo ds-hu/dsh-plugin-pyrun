@@ -1,3 +1,6 @@
 node_modules/
 .pnpm-store/
 *.log
+
+# Design-round artifacts (icon candidates opened in the sidebar); scratch, not shipped.
+.clarity/
