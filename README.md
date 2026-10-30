@@ -119,6 +119,34 @@ Cannot read properties of undefined (reading 'prepare')
 | 后台：完成通知唤醒 | 通过 |
 | 参数互斥：`timeout_ms` + `run_in_background` | 明确报错拒绝 |
 
+## 发布到 npm
+
+**仓库里没有 `NPM_TOKEN`，也没有任何 secrets。** 发布走 [可信发布（OIDC）](https://docs.npmjs.com/trusted-publishers) + [暂存发布](https://docs.npmjs.com/staged-publishing)：CI 把版本提交到暂存队列，你在 npmjs.com 用 2FA 批准才上架。
+
+为什么不再是 token：npm 自 2026-07-31 起，勾了 bypass-2FA 的 granular token 已不能做账号/包设置类敏感操作；[2027-01 起连直接 `npm publish` 也会失去，只剩「读私有包 + 提交暂存」](https://github.blog/changelog/2026-07-31-restricting-npm-bypass-2fa-granular-access-tokens/)。官方给的替代就是这两样，所以流水线一开始就按这个形状建，届时不用改。
+
+**一次性配置**
+
+1. **首次发布**（新包无法先配 Trusted Publisher）：本地 `npm login`（账号需已开 2FA）→ `npm stage publish` → npmjs.com 的「Staged Packages」里用 2FA 批准。这一步之后包才存在。
+2. **npmjs.com → 包 → Settings → Trusted publishing**：GitHub Actions、org `ds-hu`、repo `dsh-plugin-pyrun`、workflow `publish.yml`、Allowed actions 只勾 `npm stage publish`（要用 `direct` 模式才额外勾 `npm publish`）。**配置有 48 小时保鲜期**：建好后 48 小时内必须完成一次成功发布才算绑定，过期只能删了重建——所以放到第一次发版前再建。
+
+**之后每次发版**
+
+```powershell
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+CI 跑测试 → 核对 tag 与 `package.json.version` 一致 → `npm stage publish` → 你在 npmjs.com 批准（2FA）→ 版本上架。想跳过审批就直接发，用 `workflow_dispatch` 选 `direct`。
+
+**要点**
+
+- provenance 自动生成，不用加 `--provenance`：公开仓库 + 公开包，npm 在 OIDC 发布时默认附上。
+- `repository.url` 必须与 GitHub 仓库逐字一致（已指向 `ds-hu/dsh-plugin-pyrun`）；fork 里不改这行，OIDC 校验会拒。
+- 只支持 GitHub 托管 runner；`pull_request_target` / `issue_comment` 事件的 OIDC token 会被 npm 拒绝，所以发布只挂 `push` tag 与 `workflow_dispatch`。
+- workflow 里显式把 npm 升到 11.21+：`npm stage publish` 需要 11.15+，而 node 24 镜像自带哪版 npm 不由你决定。
+- 开始用可信发布后，建议在包设置 → Publishing access 选 **Require two-factor authentication and disallow tokens**，把 token 路径彻底关掉（OIDC 不受这条限制）。
+
 ## 开发
 
 - **无构建步骤**：纯 ESM JavaScript（`src/index.js`），没有 `prepare` 脚本，因此不会触发 pnpm 的构建拦截（`allowBuilds`）。
@@ -126,7 +154,7 @@ Cannot read properties of undefined (reading 'prepare')
 - **cordis 的两处分工**：`peerDependencies` 声明 `^4.0.1`（非 `dsh-*` 名，不参与版本闸门；运行实例由宿主提供）；`devDependencies` 精确锁定 `4.0.5-alpha.1`——这是 0.2.1-alpha.1 harness 家族自己钉的 cordis（npm dist-tag `dsh-0-2-1-alpha-1`），本地 dev 副本 `dsh-tools` / `dsh-sandbox` 在模块加载时就要 `import { Service } from '@deepseek-ai/cordis'`，而 `link:` 安装路径实际运行的就是这份本地副本，钉齐可避免本地树出现版本漂移。消费方 profile 永不安装 devDependencies，一律按 `package.json` 的 peer 处理。
 - **测试**：`pnpm test`（`node --test test/`）。在本 DSH 沙箱内 `node --test test/` 会因 piped-stdio spawn 被沙箱拒绝（`spawn EPERM`，沙箱边界而非测试失败），此时改用 `node test/manifest.test.mjs` 或 `node --test --test-isolation=none "test/*.test.mjs"`。
 - **不依赖 `@deepseek-ai/dsh-llm`**：`HarnessError` 只在 `errorInfo()` 的 `instanceof` 判定里被识别，而进程内插件拿到的是另一份独立拷贝，`instanceof` 必为假——与其静默退化，不如根本不走那条路（取消由运行时的规范通道处理）。
-- **图标**：`icon.svg`（64×64 瓦片，与同机其他第三方插件同形）由 `package.json.icon` 声明，并**必须**同时写进 `files`。Plugins 页经 `exports["./package.json"]` 读清单、把该文件内联成 data URL（`app-boot` 的 `readPluginMeta`：相对路径且留在包目录内，SVG/PNG/JPEG/WebP，≤256 KiB）；少任一半，行上只会显示默认图或一条元信息错误。改图标需重装（`github:` 安装读的是 profile 里那份副本）后重启才可见。`test/manifest.test.mjs` 守着这条链。
+- **图标**：`icon.svg`（64×64 瓦片，与同机其他第三方插件同形）由 `package.json.icon` 声明，并**必须**同时写进 `files`。Plugins 页经 `exports["./package.json"]` 读清单、把该文件内联成 data URL（`app-boot` 的 `readPluginMeta`：相对路径且留在包目录内，SVG/PNG/JPEG/WebP，≤256 KiB）；少任一半，行上只会显示默认图或一条元信息错误。宿主在启动时读清单，改完要在**重启** `dsh` 后才可见；`github:`/npm 安装还得先重装。`test/manifest.test.mjs` 守着这条链。
 - **改宿主半身 → 重启 `dsh`**；改 `cordis.patch.yml` 可由 `patchReload: live` 生效。
 - 重装/更新：重复执行上面的 `dsh plugin --profile web add ...`。
 

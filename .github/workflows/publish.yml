@@ -1,0 +1,88 @@
+# Publishing runs on trusted publishing (OIDC): the registry trusts this workflow
+# by its filename, so no NPM_TOKEN is stored in the repository. npm refuses OIDC
+# tokens from `pull_request_target` and `issue_comment` events; push, release and
+# workflow_dispatch are the events that work.
+#
+# The default mode is `staged`: `npm stage publish` puts the version in npm's
+# staging queue and a maintainer approves it with 2FA. That is the shape npm is
+# moving toward — from January 2027 tokens that bypass 2FA lose direct publish,
+# leaving reading private packages and staging only — so the pipeline needs no
+# change then.
+#
+# One-time setup, in npmjs.com → the package → Settings → Trusted publishing:
+#   provider GitHub Actions · org `ds-hu` · repo `dsh-plugin-pyrun`
+#   workflow `publish.yml` · allowed actions: `npm stage publish`
+#   (add `npm publish` only if you want the `direct` mode below to work)
+# A configuration must complete its first successful publish within 48 hours or
+# it expires and can no longer authorize anything — set it up right before the
+# first tagged release. Provenance attestations are automatic for a public
+# repository publishing a public package; they do not need a flag.
+
+name: publish
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'staged rides the queue until a maintainer approves it with 2FA; direct publishes now'
+        type: choice
+        default: staged
+        options: [staged, direct]
+
+permissions:
+  contents: read
+  id-token: write # the OIDC token npm exchanges for a short-lived publish token
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest # trusted publishing is cloud runners only
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+
+      - uses: actions/setup-node@v6
+        with:
+          # trusted publishing needs npm >= 11.5.1 and node >= 22.14
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false # never cache a release build
+
+      - name: npm must be new enough to stage
+        # `npm stage publish` needs >= 11.15, and the node 24 image ships whatever
+        # npm it was built with — pin it instead of trusting the image
+        run: |
+          npm install -g npm@^11.21.0
+          npm --version
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm test
+
+      - name: The tag must be the manifest version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          expected="v$(node -p "require('./package.json').version")"
+          echo "tag ${GITHUB_REF_NAME}, manifest ${expected}"
+          test "${GITHUB_REF_NAME}" = "${expected}" || {
+            echo "::error::tag ${GITHUB_REF_NAME} does not match package.json (${expected})"
+            exit 1
+          }
+
+      - name: Publish
+        env:
+          MODE: ${{ inputs.mode || 'staged' }}
+        run: |
+          if [ "${MODE}" = "direct" ]; then
+            npm publish
+          else
+            npm stage publish
+          fi
