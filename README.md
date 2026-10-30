@@ -58,9 +58,21 @@ Cannot read properties of undefined (reading 'prepare')
 - `[timed out after Nms]` / `[aborted]`
 - `[stderr]` 分节承载 stderr
 - `[output truncated; full output: <path>]` —— 超长输出截尾，完整内容落在溢出文件里
+- `[code saved: <path>]` —— 长程序非零退出后，源码原文已落盘（见下）
 - `[sandbox: file access denied under <mode> mode]` + 同轮提权提示
 
 后台作业用 `job_output` 收割、`job_kill` 停止，`job_list` 查看名册（kind 显示为 `python`）。
+
+### 失败源码落盘
+
+前台或后台运行以**真实非零退出码**结束（超时与被杀没有退出码，不算）、且源码长度 `> 2000` 字符时，源码原文会被写成一个 `.py` 文件：
+
+- 位置：`<会话 cwd>/.dsh/pyrun/`；该次运行的生效沙箱模式为 `read-only` 时跳过（该模式承诺不写文件）
+- 文件名：`<YYYYMMDD-HHmmss>-<首行 slug>.py`，例如 `20261030-220458-fetch-parquet.py`；同一秒同名冲突时追加内容哈希
+- 内容：与交给解释器的源码逐字一致（不加头部注释），可用 `edit` 就地修改；重跑时把改后的内容作为 `code` 传回
+- 前台结果多一行 `[code saved: <path>]`（输出 schema 中为 `savedCodePath`）；后台作业的终态 `detail` 变为 `exit code: N; code saved: <path>`
+
+写入是尽力而为：目录不可写、磁盘满等失败会被吞掉，已结算的运行不会因此变成错误。`.dsh/pyrun/` 不自动清理（避免删掉用户改过的版本）；介意它出现在 `git status` 就把 `.dsh/` 写进项目 `.gitignore`。
 
 ## 版本契约与迁移说明
 
@@ -161,7 +173,9 @@ CI 跑测试 → 核对 tag 与 `package.json.version` 一致 → `npm stage pub
 ## 已知限制
 
 - **没有 promote-on-timeout（刻意决策）**：内置 `pwsh`/`bash` 工具在前台超时后会把命令转成后台作业继续跑；本工具维持"超时即杀"（`onExpiry: 'kill'`，与历史版本模型可见语义一致，输出 union 不引入 `promoted` 分支），只保留已产出的部分输出。需要长跑的程序直接用 `run_in_background`。
-- **没有 Config**：超时、输出上限一律用执行器的默认值与上限。
+- **没有 Config**：超时、输出上限一律用执行器的默认值与上限；失败源码阈值固定为 2000 字符（`src/persist.js` 的 `FAILED_CODE_THRESHOLD_CHARS`），要改就改常量。
+- **只保存真实退出的失败**：超时（`timedOut`）与被杀（`signal`）没有退出码，不落盘；`read-only` 组合同样不落盘。
+- **不自动清理** `.dsh/pyrun/`：避免删掉用户改过的版本；需要时手动删目录。
 - **与同名工具冲突**：本插件在 web profile 里注册 `python`。重启后不要再激活动态插件 `pyrun-1`（它注册同名工具，且进程内已不存在）。
 - **依赖 PATH 中的 `python`**：插件不探测解释器路径。
 

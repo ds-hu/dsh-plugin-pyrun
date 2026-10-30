@@ -23,6 +23,12 @@ import {
   sandboxDenialMarker,
   validateEscalationArgs,
 } from '@deepseek-ai/dsh-sandbox'
+import {
+  FAILED_CODE_DIR,
+  FAILED_CODE_THRESHOLD_CHARS,
+  persistFailedCode,
+  shouldPersistFailedCode,
+} from './persist.js'
 
 export const name = 'dsh-plugin-pyrun'
 
@@ -66,15 +72,19 @@ function sandboxNotes(sandbox, escalationModes) {
  * `killed` stays `killed` (the signal when one is known), everything else is
  * `completed` with the exit code as detail — a nonzero Python exit is
  * reported, not failed, exactly like the foreground rendering. Sandbox facts
- * join the detail, since a job's terminal reason is the one line every
- * reader — the model's status line, the roster row — shows.
+ * and the persisted-source path join the detail, since a job's terminal reason
+ * is the one line every reader — the model's status line, the roster row —
+ * shows.
  */
-function processOutcome(proc, escalationModes) {
+async function processOutcome(proc, escalationModes, persistCode) {
   const base = proc.status === 'killed'
     ? { status: 'killed', detail: proc.signal !== null ? `signal: ${proc.signal}` : 'killed before exit' }
     : { status: 'completed', detail: `exit code: ${proc.exitCode ?? 0}` }
   const notes = sandboxNotes(proc.sandbox, escalationModes)
-  return notes.length === 0 ? base : { ...base, detail: `${base.detail}; ${notes.join(' ')}` }
+  const savedCodePath = await persistCode(proc.exitCode)
+  const parts = [base.detail, ...notes]
+  if (savedCodePath !== undefined) parts.push(`code saved: ${savedCodePath}`)
+  return parts.length === 1 ? base : { ...base, detail: parts.join('; ') }
 }
 
 /**
@@ -147,7 +157,7 @@ function resolveWorkdir(modelWorkdir, exec) {
 }
 
 /** Detach the executor result from readonly Service Definition types into plain JSON data. */
-function canonicalResult(result) {
+function canonicalResult(result, savedCodePath) {
   const output = stream => ({
     text: stream.text,
     truncated: stream.truncated,
@@ -163,6 +173,7 @@ function canonicalResult(result) {
     stdout: output(result.stdout),
     stderr: output(result.stderr),
     ...result.sandbox !== undefined ? { sandbox: result.sandbox } : {},
+    ...savedCodePath !== undefined ? { savedCodePath } : {},
   }
 }
 
@@ -179,6 +190,9 @@ function pythonDescription(backgroundEnabled) {
     + 'by the deployment maximum. The Python exit code is forwarded exactly (`[exit code: N]` marker); '
     + 'non-zero exits are results, not errors. Long output is tail-truncated with the full stream spilled '
     + 'to a file whose path is reported. '
+    + `When a program longer than ${FAILED_CODE_THRESHOLD_CHARS} characters exits non-zero and the sandbox `
+    + 'mode permits writes, its source is saved verbatim under `.dsh/pyrun/` in the session '
+    + 'workspace and the result reports `[code saved: <path>]`, so the next attempt can edit that file in place. '
   return base + (backgroundEnabled
     ? 'Set `run_in_background: true` to start the program as a background job and get its job id immediately; '
       + 'collect incremental output with `job_output` and stop it with `job_kill`. No timeout applies to a '
@@ -207,6 +221,7 @@ const FOREGROUND_BRANCH = {
     timedOut: { type: 'boolean', required: true },
     aborted: { type: 'boolean', required: true },
     timeoutMs: { type: 'number', required: true },
+    savedCodePath: { type: 'string' },
     stdout: {
       type: 'object',
       additionalProperties: false,
@@ -260,6 +275,7 @@ function renderForeground(value, escalationModes) {
   if (value.signal !== null) markers.push(`[killed by signal: ${value.signal}]`)
   else if (value.aborted) markers.push('[aborted]')
   else if (value.exitCode !== 0) markers.push(`[exit code: ${value.exitCode}]`)
+  if (value.savedCodePath !== undefined) markers.push(`[code saved: ${value.savedCodePath}]`)
   if (markers.length === 0) return body
   if (!body.endsWith('\n')) body += '\n'
   return body + markers.join('\n')
@@ -290,6 +306,21 @@ export function apply(ctx) {
   /** Resolve the complete standing policy for this call when a confining executor is mounted. */
   const resolveStandingPolicy = exec =>
     sandboxPolicy?.resolve(exec.agent === undefined ? {} : { session: exec.agent.session })
+
+  /** Where a failing source lands: the session workspace, not the host process's own cwd (they differ under `link:` installs). */
+  const failedCodeDir = exec => resolve(exec.agent?.session.header.cwd ?? process.cwd(), FAILED_CODE_DIR)
+
+  /**
+   * Persist the source of a qualifying failure. Skipped when the source is
+   * short, the exit was not a real non-zero code, the effective mode is
+   * `read-only` (the composition promises no writes), or the write fails —
+   * bookkeeping never turns a settled run into an error.
+   */
+  const persistFailure = async (exec, code, exitCode, policy) => {
+    if (policy?.mode === 'read-only') return undefined
+    if (!shouldPersistFailedCode(code, exitCode)) return undefined
+    return persistFailedCode({ dir: failedCodeDir(exec), code })
+  }
 
   /**
    * Resolve a sandbox-escalation request through `ctx.approval` BEFORE anything
@@ -403,7 +434,11 @@ export function apply(ctx) {
             // after the registry admitted the job.
             const hooks = pythonJob(
               async (signal) => (proc = await ctx.shell.execute({ ...spec, signal })),
-              started => processOutcome(started, escalationModes),
+              started => processOutcome(
+                started,
+                escalationModes,
+                exitCode => persistFailure(exec, args.code, exitCode, policy),
+              ),
             )
             return { done: hooks.done, cancel: (reason) => hooks.cancel(reason) }
           },
@@ -411,7 +446,9 @@ export function apply(ctx) {
         return { kind: 'background', jobId: id }
       }
       const execution = await ctx.shell.execute(ctx.shell.resolve({ ...request, signal: exec.signal }))
-      return canonicalResult(await execution.result())
+      const result = await execution.result()
+      const savedCodePath = await persistFailure(exec, args.code, result.exitCode, policy)
+      return canonicalResult(result, savedCodePath)
     },
     presentCall(args) {
       return args.run_in_background === true
