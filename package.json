@@ -1,5 +1,5 @@
 {
-  "name": "dsh-plugin-pyrun",
+  "name": "@ds-hu/dsh-plugin-pyrun",
   "version": "0.1.0",
   "icon": "./icon.svg",
   "license": "MIT",

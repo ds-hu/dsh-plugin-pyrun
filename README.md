@@ -12,6 +12,8 @@ DeepSeek Harness 的 Python 快捷执行工具插件：模型直接给 Python �
 
 ## 安装
 
+**npm 包名是 `@ds-hu/dsh-plugin-pyrun`**（GitHub 仓库仍叫 `dsh-plugin-pyrun`；仓库名只影响 `repository.url`）。Loader 行的 `name` 必须是这个包名逐字不差，原因见下节。
+
 ```powershell
 dsh plugin --profile web add link:D:/Projects/dsh-plugin-pyrun
 ```
@@ -71,7 +73,7 @@ Cannot read properties of undefined (reading 'prepare')
 | 契约依据：签出仓库 `D:\Projects\deepseek-harness` @ `5badb15009` | **0.2.1-alpha.1**（tag `dsh-v0.2.1-alpha.1`）← 契约以此为准 |
 | npm 已发布的 0.2.x 运行时 | `0.2.0-rc.1`、`0.2.0-rc.2`、`0.2.1-alpha.1`，peer 范围 `^0.2.0-rc.1` 全部覆盖 |
 
-`peerDependencies` 是**加载闸门**：`app-boot` 的 `plugin-compatibility.ts` 用 `semver.satisfies(运行时, 范围, { includePrerelease: true })` 逐个检查 `@deepseek-ai/dsh-*` 的 peer，任一不满足即把本包整层跳过（启动日志打出 `skipping profile bundle "dsh-plugin-pyrun"`）。`^0.2.0-rc.1` 覆盖全部 0.2.x 且不再覆盖 0.1.x——**本包在 0.1.x 宿主上会被版本闸门拒绝加载**，0.1.x 用户请继续使用本仓库上一提交（0.1.5-rc.2 契约版本）。`test/manifest.test.mjs` 把这条闸门判定做成了常驻断言。
+`peerDependencies` 是**加载闸门**：`app-boot` 的 `plugin-compatibility.ts` 用 `semver.satisfies(运行时, 范围, { includePrerelease: true })` 逐个检查 `@deepseek-ai/dsh-*` 的 peer，任一不满足即把本包整层跳过（启动日志打出 `skipping profile bundle "@ds-hu/dsh-plugin-pyrun"`）。`^0.2.0-rc.1` 覆盖全部 0.2.x 且不再覆盖 0.1.x——**本包在 0.1.x 宿主上会被版本闸门拒绝加载**，0.1.x 用户请继续使用本仓库上一提交（0.1.5-rc.2 契约版本）。`test/manifest.test.mjs` 把这条闸门判定做成了常驻断言。
 
 ### 本包当前依赖的运行契约（0.2.x）
 
@@ -156,6 +158,7 @@ CI 跑测试 → 核对 tag 与 `package.json.version` 一致 → `npm stage pub
 - **不依赖 `@deepseek-ai/dsh-llm`**：`HarnessError` 只在 `errorInfo()` 的 `instanceof` 判定里被识别，而进程内插件拿到的是另一份独立拷贝，`instanceof` 必为假——与其静默退化，不如根本不走那条路（取消由运行时的规范通道处理）。
 - **图标**：`icon.svg`（64×64 瓦片，与同机其他第三方插件同形）由 `package.json.icon` 声明，并**必须**同时写进 `files`。Plugins 页经 `exports["./package.json"]` 读清单、把该文件内联成 data URL（`app-boot` 的 `readPluginMeta`：相对路径且留在包目录内，SVG/PNG/JPEG/WebP，≤256 KiB）；少任一半，行上只会显示默认图或一条元信息错误。宿主在启动时读清单，改完要在**重启** `dsh` 后才可见；`github:`/npm 安装还得先重装。`test/manifest.test.mjs` 守着这条链。
 - **改宿主半身 → 重启 `dsh`**；改 `cordis.patch.yml` 可由 `patchReload: live` 生效。
+- **改包名 = 三处同改 + 重装 profile**：`package.json.name`、`cordis.patch.yml` 行的 `name`（Loader 按它 import）、`src/index.js` 的 `export const name`，然后 profile 侧 `remove` 旧名再 `add`，让 `node_modules/@scope/<新名>` 真的存在。漏改不会当场报错：旧的 `node_modules/<旧名>` 链接还在，插件照常启动；等下一次安装按新名物化后，启动只剩一行 `skipping profile bundle "<旧名>"`，插件静默消失。`test/manifest.test.mjs` 把「行名 == 包名 == 导出名」钉成了常驻断言。
 - 重装/更新：重复执行上面的 `dsh plugin --profile web add ...`。
 
 ## 已知限制
@@ -180,7 +183,7 @@ pnpm why @deepseek-ai/dsh-tools
 Get-ChildItem "$env:USERPROFILE\.dsh" -Recurse -Directory -Filter 'dsh-tools' -ErrorAction SilentlyContinue
 ```
 
-处置：确认清单里它不在 `dependencies`（在就改回 `devDependencies` 并 `pnpm install`）；profile 侧 `dsh plugin --profile web remove dsh-plugin-pyrun` 再重新 `add`（让 pnpm 重算 profile 的 node_modules）；**完全重启 `dsh`**（`patchReload: live` 不重载已缓存的模块）。
+处置：确认清单里它不在 `dependencies`（在就改回 `devDependencies` 并 `pnpm install`）；profile 侧 `dsh plugin --profile web remove @ds-hu/dsh-plugin-pyrun` 再重新 `add`（让 pnpm 重算 profile 的 node_modules）；**完全重启 `dsh`**（`patchReload: live` 不重载已缓存的模块）。
 
 ⚠️ **崩溃轮次会毒化会话**：那一轮留下了没有对应 `tool/result` 的孤儿 `tool_calls`，此后该会话每轮都报 `INVALID_REQUEST: ... tool calls need immediate results`；插件修好也救不回来，只能弃用并新建会话。
 

@@ -120,6 +120,33 @@ test('the local dev copies are pinned inside the declared contract', () => {
   }
 })
 
+test('every Loader row names the package exactly', async () => {
+  // The row `name` is the specifier the Loader imports from the profile's
+  // cordis.yml, and app-boot resolves the bundle layer by that same name. Drift
+  // is silent: while an old node_modules/<old-name> link survives the plugin
+  // still boots, and the first install that materialises the real package name
+  // turns into `skipping profile bundle "<old-name>"` — absent from every later
+  // start, with nothing pointing back at the rename.
+  const patch = await readFile(join(root, 'cordis.patch.yml'), 'utf8')
+  const names = [...patch.matchAll(/^\s*name:\s*(\S+)\s*$/gm)]
+    .map(match => match[1].replace(/^['"]|['"]$/g, ''))
+  assert.ok(names.length > 0, 'cordis.patch.yml must insert at least one Loader row')
+  for (const name of names) {
+    assert.equal(
+      name,
+      manifest.name,
+      `row ${JSON.stringify(name)} must be the module specifier the Loader resolves, i.e. package.json.name`,
+    )
+  }
+})
+
+test('the plugin registers under the package name', async () => {
+  // cordis keys the plugin by this export: logger tags, config dumps and the
+  // profile tree all read it, so a stale value is a second identity.
+  const plugin = await import('../src/index.js')
+  assert.equal(plugin.name, manifest.name)
+})
+
 test('the Plugins page icon is declared, shipped, and self-contained', async () => {
   // app-boot's readPluginMeta paints the Plugins row from `package.json.icon`:
   // it resolves ./package.json through the package's own exports, treats the

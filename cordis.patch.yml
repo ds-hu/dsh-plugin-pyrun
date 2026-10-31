@@ -1,5 +1,9 @@
 # Loader rows this package contributes when installed as a bundle:
-#   dsh plugin --profile web add D:/Projects/dsh-plugin-pyrun
+#   dsh plugin --profile web add link:D:/Projects/dsh-plugin-pyrun
+# The row name is the specifier the Loader imports, so it must equal the
+# package.json name verbatim. A stale bare name keeps booting while an old
+# node_modules/<old-name> link survives, then drops the plugin from the next
+# start (`skipping profile bundle`) with no error that points back here.
 - insert:
-    - id: dsh-plugin-pyrun
-      name: dsh-plugin-pyrun
+    - id: '@ds-hu/dsh-plugin-pyrun'
+      name: '@ds-hu/dsh-plugin-pyrun'

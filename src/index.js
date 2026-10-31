@@ -1,5 +1,5 @@
 /**
- * dsh-plugin-pyrun — Python quick-exec tool for DeepSeek Harness.
+ * @ds-hu/dsh-plugin-pyrun — Python quick-exec tool for DeepSeek Harness.
  *
  * Registers a `python` tool that pipes the model's source straight to
  * `python -X utf8 -u -` over stdin: no shell quoting layer, one call instead of
@@ -11,7 +11,7 @@
  * deepseek-harness @ 5badb15009 = 0.2.1-alpha.1; the 0.1.5-rc.2 world this
  * plugin grew up in is described historically in the README).
  *
- * @module dsh-plugin-pyrun
+ * @module @ds-hu/dsh-plugin-pyrun
  */
 
 import { isAbsolute, resolve } from 'node:path'
@@ -24,7 +24,8 @@ import {
   validateEscalationArgs,
 } from '@deepseek-ai/dsh-sandbox'
 
-export const name = 'dsh-plugin-pyrun'
+/** Cordis plugin name: the package name verbatim, so the row and the plugin read the same in a dump. */
+export const name = '@ds-hu/dsh-plugin-pyrun'
 
 /** `tools` registers the tool, `shell` executes it, `shellEnv` supplies the managed DSH_* facts. */
 export const inject = ['tools', 'shell', 'shellEnv']
@@ -284,7 +285,7 @@ export function apply(ctx) {
   const escalationModes = defaultMode === undefined ? [] : ESCALATION_TARGETS
   const sandboxPolicy = defaultMode === undefined ? undefined : ctx.get('sandboxPolicy')
   if (defaultMode !== undefined && sandboxPolicy === undefined) {
-    throw new Error('dsh-plugin-pyrun: the mounted shell executor confines but ctx.sandboxPolicy is missing')
+    throw new Error('@ds-hu/dsh-plugin-pyrun: the mounted shell executor confines but ctx.sandboxPolicy is missing')
   }
 
   /** Resolve the complete standing policy for this call when a confining executor is mounted. */
