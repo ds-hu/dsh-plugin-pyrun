@@ -1,190 +1,82 @@
-# dsh-plugin-pyrun
+English | [中文](https://github.com/ds-hu/dsh-plugin-pyrun/blob/main/README.zh.md)
 
-DeepSeek Harness 的 Python 快捷执行工具插件：模型直接给 Python 源码，一步返回结果。
+# pyrun
 
-它存在的理由是消除在 Windows/PowerShell 里驱动 Python 的三个痛点：
+**Run Python in DeepSeek Harness with one tool call.** The model writes the program;
+pyrun hands it to `python -X utf8 -u -` on stdin — no shell quoting layer, no temporary
+script, UTF-8 on both streams, under the same sandbox and approval rules as the built-in
+`pwsh` tool.
 
-1. **转义地狱** —— 源码经工具参数（JSON）直接写进子进程 `stdin`，不经过任何 shell 引号层。
-2. **两步成本** —— 不再需要"先写临时脚本、再执行"，一次调用完成。
-3. **编码异常** —— 全链路 UTF-8：`python -X utf8 -u -`，stdout/stderr 按 UTF-8 解码，中文与 emoji 原样往返。
+[![npm version](https://img.shields.io/npm/v/@ds-hu/dsh-plugin-pyrun.svg)](https://www.npmjs.com/package/@ds-hu/dsh-plugin-pyrun)
+[![npm downloads](https://img.shields.io/npm/dm/@ds-hu/dsh-plugin-pyrun.svg)](https://www.npmjs.com/package/@ds-hu/dsh-plugin-pyrun)
+[![ci](https://img.shields.io/github/actions/workflow/status/ds-hu/dsh-plugin-pyrun/ci.yml?branch=main)](https://github.com/ds-hu/dsh-plugin-pyrun/actions/workflows/ci.yml)
+[![license](https://img.shields.io/github/license/ds-hu/dsh-plugin-pyrun.svg)](LICENSE)
+[![dsh](https://img.shields.io/badge/dsh-0.2.x-4b32c3)](AGENTS.md#runtime-contract)
 
-前台与后台两种模式与内置 `pwsh` 工具同语义（同一份沙箱策略、同一套提权审批、同一套标记词汇）。
+```text
+python(code="""from datetime import date
+print(f"你好 {date.today()}")""")
 
-## 安装
+→ 你好 2026-11-05
+```
 
-**npm 包名是 `@ds-hu/dsh-plugin-pyrun`**（GitHub 仓库仍叫 `dsh-plugin-pyrun`；仓库名只影响 `repository.url`）。Loader 行的 `name` 必须是这个包名逐字不差，原因见下节。
+## What it deletes
+
+| You need to | Built-in route today | With pyrun |
+|---|---|---|
+| Run a snippet | `pwsh` → `python -c "…"` → escape every quote | one `python` call, source verbatim |
+| Run a multi-line script | write a `.py` file, run it, delete it | the same call, no file left behind |
+| Get Chinese output back | GBK mangling on the way home | UTF-8 end to end, emoji included |
+| Run a ten-minute job | the call blocks until the timeout | `run_in_background: true`, collect with `job_output` |
+| Write outside the workspace | denied, no way forward | one-shot `sandbox_permissions` retry with approval |
+
+## Install
+
+```powershell
+dsh plugin --profile web add @ds-hu/dsh-plugin-pyrun
+```
+
+Then **restart `dsh`**: the host half is a Node module and is only re-read at startup.
+The Plugins page in the Web UI installs the same package.
+
+From a checkout, for development:
 
 ```powershell
 dsh plugin --profile web add link:D:/Projects/dsh-plugin-pyrun
 ```
 
-显式写 `link:`：`link:` 安装只在 profile 里建一个软链，**不往 profile 装任何依赖**（本机 profile 里 `personal-track` 就是 `link:`，它的 `zod` / `schemastery` 都不在 profile 根）。这样 profile 里绝不会多出核心包副本，改完本仓库代码重启即生效。
+Requires DSH 0.2.x and `python` on `PATH` — the plugin does not probe for an interpreter.
+Swap `web` for the profile you actually run.
 
-`dsh plugin add` 写 `~/.dsh` 并运行 pnpm，在受限沙箱下需要一次性提权。安装成功后该包作为一层 bundle 进入 profile（因为它声明了 `dsh.bundle.patch`）。
+## Use
 
-**装完必须重启 `dsh`。** 宿主半身是 Node ESM 模块，只有重启才会重新加载；profile 的 `patchReload: live` 只重读 patch，不重载已缓存的模块。
+Every call is one program.
 
-### 核心包契约：消费方 profile 里只允许存在一份
-
-`@deepseek-ai/dsh-tools` 与 `@deepseek-ai/dsh-sandbox` 的声明分两处，各司其职：
-
-| 位置 | 作用 |
+| Field | What it is for |
 |---|---|
-| `peerDependencies` | 运行契约：真正跑这份代码的实例由 harness 提供（非 `link:` 安装时走 `~/.dsh/profiles/node_modules` 回退层，其中 `@deepseek-ai/*` 全部软链到 `...\node_modules\@deepseek-ai\dsh` 的宿主安装树），与宿主 agent loop 共享**同一份物理副本** |
-| `devDependencies`（精确锁定 `0.2.1-alpha.1`） | 只为本仓库服务：本插件以 `link:` 安装，Node 按 realpath 从 `D:\Projects\dsh-plugin-pyrun` 解析用它自己的 `import`，而回退层不是它的祖先目录（缺这份副本会直接 `ERR_MODULE_NOT_FOUND` 加载失败）。**消费方 profile 永不安装依赖的 devDependencies**，所以它不会落到 profile 里 |
+| `code` | the program, executed verbatim through stdin |
+| `workdir` | working directory; defaults to the session's, and a relative path resolves against it |
+| `timeout_ms` | foreground budget; rejected together with a background run |
+| `run_in_background` | returns a job id at once; no timeout applies |
+| `sandbox_permissions` + `justification` | one-shot retry of a call the sandbox just denied |
 
-**绝不要把这两个包写进 `dependencies`。** 除 `link:` 之外的安装方式（`file:` / 打包 / registry / git）都会让 profile 安装插件的普通依赖——本机 profile 用 `nodeLinker: hoisted`，会直接把它们物化到 profile 根 `node_modules`——于是进程里出现第二份 `dsh-tools`。它用模块局部 `Symbol('@deepseek-ai/dsh-tools.scheduler')` 当工具调度器的键，两份副本的 Symbol 不相等 → `ctx.tools[TOOL_RUNTIME_SCHEDULER]` 为 `undefined` → **该进程内所有工具调用**都崩在 agent-loop 的 `tool-calls` 上：
+Output is stdout, then a `[stderr]` section, then markers: `[exit code: N]` (a non-zero
+exit is a result, not a failure), `[timed out after Nms]`, `[killed by signal: …]`,
+`[output truncated; full output: <path>]`, `[sandbox: file access denied under <mode> mode]`.
 
-```
-Cannot read properties of undefined (reading 'prepare')
-```
+Background jobs appear in `job_list` with kind `python`, are read with `job_output`, and
+stopped with `job_kill`.
 
-`defineTool` 与沙箱辅助函数都不携带跨包的 Symbol 状态，因此插件本地那份 devDependencies 副本是惰性的、不会参与宿主的调度器查表；只有被**消费方**安装并提升进 profile 的那一份才造成分裂。`link:` 安装更是连普通依赖都不装（本机 profile 里 `personal-track` 的 `zod` / `schemastery` 都不在 profile 根，可作对照）。`pnpm test` 的清单断言守着「必须在 peer、可在 dev、绝不可在 dependencies」这条规则。
+## Limits
 
-## 用法
+- A foreground timeout kills the program; it never promotes to a background job. For long
+  work, pass `run_in_background` on the first call.
+- The program cannot read interactive input — stdin carries the source.
+- No config surface: the executor's own defaults and caps decide timeouts and output limits.
 
-工具名 `python`，参数：
+## More
 
-| 参数 | 类型 | 说明 |
-|---|---|---|
-| `code` | string（必填） | Python 程序原文，经 `stdin` 执行 |
-| `workdir` | string | 工作目录；缺省用会话 cwd，相对路径按会话 cwd 解析 |
-| `timeout_ms` | number | 前台超时；缺省用执行器默认值，并受部署上限约束。**后台运行时不适用** |
-| `run_in_background` | boolean | 后台运行，立即返回 job id（该组合存在时才广告） |
-| `sandbox_permissions` | enum | 更宽的沙箱模式，仅用于对刚被拒绝的调用做一次性重试，需配 `justification` |
-| `justification` | string | 一句话说明，展示在审批面板里 |
+Runtime contract, dependency placement, release process, and the "every tool call fails"
+troubleshooting live in [AGENTS.md](AGENTS.md).
 
-结果标记：
-
-- `[exit code: N]` —— 非零退出码是结果而非错误，N 为 Python 的真实退出码
-- `[timed out after Nms]` / `[aborted]`
-- `[stderr]` 分节承载 stderr
-- `[output truncated; full output: <path>]` —— 超长输出截尾，完整内容落在溢出文件里
-- `[sandbox: file access denied under <mode> mode]` + 同轮提权提示
-
-后台作业用 `job_output` 收割、`job_kill` 停止，`job_list` 查看名册（kind 显示为 `python`）。
-
-## 版本契约与迁移说明
-
-本包由本会话内的动态 Cordis 插件 `pyrun-1` 迁移而来（最终版 `pkg-5` 的等价移植），初版面向 **0.1.5-rc.2** 运行契约，现已完成向 **0.2.x** 的整体移植。
-
-| 树 | 版本 |
-|---|---|
-| 契约依据：签出仓库 `D:\Projects\deepseek-harness` @ `5badb15009` | **0.2.1-alpha.1**（tag `dsh-v0.2.1-alpha.1`）← 契约以此为准 |
-| npm 已发布的 0.2.x 运行时 | `0.2.0-rc.1`、`0.2.0-rc.2`、`0.2.1-alpha.1`，peer 范围 `^0.2.0-rc.1` 全部覆盖 |
-
-`peerDependencies` 是**加载闸门**：`app-boot` 的 `plugin-compatibility.ts` 用 `semver.satisfies(运行时, 范围, { includePrerelease: true })` 逐个检查 `@deepseek-ai/dsh-*` 的 peer，任一不满足即把本包整层跳过（启动日志打出 `skipping profile bundle "@ds-hu/dsh-plugin-pyrun"`）。`^0.2.0-rc.1` 覆盖全部 0.2.x 且不再覆盖 0.1.x——**本包在 0.1.x 宿主上会被版本闸门拒绝加载**，0.1.x 用户请继续使用本仓库上一提交（0.1.5-rc.2 契约版本）。`test/manifest.test.mjs` 把这条闸门判定做成了常驻断言。
-
-### 本包当前依赖的运行契约（0.2.x）
-
-- 前台执行：`const execution = await ctx.shell.execute(spec)`，再 `await execution.result() → ShellRunResult`；**"前台"是等待方式的属性，不是 spawn 的属性**。前台显式带 `signal: exec.signal`，保持默认 `onExpiry: 'kill'`（超时即杀）
-- 后台启动：spawn 发生在 jobs registry 的 starter 内——`run: () => { proc = await ctx.shell.execute({ ...spec, signal }) }`；`spec` 预先以 `onExpiry: 'none'` 解析（后台不设时限，取消归作业的 `cancel(reason)`，不接 `exec.signal`）
-- 句柄 `ShellExecution` = `ShellProcess`（`status` / `exitCode` / `signal` / `done` / `kill()`）+ `result()`；非消费读走 `observed.stdout/stderr.readFrom(byte)`
-- `jobs.start({ kind, label, owner, output, run })`：`owner` 是 **SessionId**（`exec.agent.id`，不再是 Agent 活对象）；`output: [JobOutputSource]` 拉取源由 registry 按自己的节奏泵进输出环，`job_output` 负责渲染（`[stderr]` 分节、丢字通知都在那一层）
-- `JobHooks = { cancel(reason?), done: Promise<JobOutcome> }`——**没有 `readOutput`**；`JobOutcome = { status, detail?, result? }`，sandbox 否决/运行器失败折入终态 `detail`
-- 沙箱三件套不变：`ctx.shell.sandboxMode`（默认模式）、`ctx.get('sandboxPolicy').resolve({ session })`、`ctx.shellEnv.collect(exec)`；"执行器受限但 `ctx.sandboxPolicy` 缺失即抛"的组合守卫保留
-- 参照实现：`packages/shell/tool-pwsh/src/index.ts` 的 `startJob`；其私有 helper（`processSources` / `processJob`）不在任何公开导出里，本包在 `src/index.js` 内自持最小等价物（`pythonSources` / `pythonJob`）
-
-### 从 0.1.5-rc.2 到 0.2.x 的变更记录（历史）
-
-初版（0.1.5-rc.2 契约）用的是 `ctx.shell.run()` / `ctx.shell.start()` / Agent 活对象 owner / hooks 的 `readOutput()` 消费游标 / `JobOutcome.output`——那是 `0.1.7-rc.1` 起被删除、0.2.x 未回退的旧世界（官方记录：`.agents/notes/implemented/feature/2026-08-26-shell-execute-projection-and-jobs-at-start.md`、`.agents/notes/implemented/architecture/2026-09-03-jobs-seam-consolidation.md`）。当时最大的教训是**运行版本 ≠ 签出版本**：动态版第一版（`pkg-4`）按签出仓库的 0.1.6 API 写（`owner: exec.agent.id`），而运行的 0.1.5-rc.2 要求 Agent 活对象，加载即报 `Cannot read properties of undefined (reading 'Symbol(dsh.scope)')`；`pkg-5` 按运行版契约重写后全绿。0.2.x 把 `pkg-4` 当年"写错"的方向变成了正式契约。
-
-`kind: 'python'` 两版都合法：注册表把 kind 当作不透明的 id 命名空间（`'pwsh'` 就是既有先例，它并不在 `JobKindMap` 里）。
-
-### 已废弃的历史 workaround
-
-**1. 跨域审批**（动态插件时期）。动态包跑在 `node:vm` 沙箱 realm 里，其构造的请求对象被 api 网关的 `isPlainRecord` 拒绝——那道检查用宿主域的 `prototype` 做恒等判断，沙箱域对象不匹配，于是所有提权静默降级为 `unavailable`。当时的绕过办法是 `Object.create(null)`（null 原型在两域都通过检查）。
-
-**树内进程插件不需要这个绕过**：进程内对象本来就是宿主域。本包直接使用官方助手 `approveEscalation()`，错误文案与动态版逐字相同。
-
-> 上游仍值得修：`packages/api/gateway/src/stream-protocol.ts` 的 `isPlainRecord` 应当跨域容忍（`cordis-host-runner/guard.ts` 里同名的那个函数就是特意做成跨域容忍的）。任何动态插件调用 `approval.request()` 或 `userQuestions.ask` 都会踩到它。
-
-**2. 退出码坍缩。** `pwsh -Command` 下原生命令的非零退出码会坍缩成 `1`（宿主级既有行为，内置 `pwsh` 工具同样受影响；shell 层的 `exit N` 正常）。修法是在命令尾部追加 `; exit $LASTEXITCODE`，本包对 Windows 分支这么做。bash 执行器天然透传退出码，故按 `process.platform` 分流命令串。
-
-**3. stdin 直灌。** 代码经 JSON 参数写进 `stdin` 而不是 argv：没有引号层、没有 32K 命令行长度上限、`-u` 免缓冲、`-X utf8` 免 GBK 干扰。
-
-### 动态版验证矩阵（`pkg-5` 实测，本包接口等价）
-
-| 验证项 | 结果 |
-|---|---|
-| 编码往返（中文 / emoji / 箭头，`repr` 对照） | 原样无损 |
-| SyntaxError → stderr UTF-8 traceback，`<stdin>` 模式 | 通过 |
-| 退出码 `sys.exit(3)` → `[exit code: 3]` | 通过（依赖 `; exit $LASTEXITCODE`） |
-| 沙箱：工作区内写 + 删 / 越界拒绝 + 标记 + 提权提示 | 与 pwsh 工具同语义 |
-| 超时（2s 杀 60s sleep）→ 部分输出保留 | 通过 |
-| 截断（1.3MB）→ 尾部保留 + 溢出文件路径 | 通过 |
-| 提权：审批面板 → 授权 → 越界写成功 → 清理 | 通过 |
-| 后台：启动即返 id → `job_output` 增量收割（含 `[stderr]` 分节） | 通过 |
-| 后台：等待超时 → 部分输出 + 作业存活 | 通过 |
-| 后台：`job_kill` → 结算 `killed`，缓冲输出仍可读 | 通过 |
-| 后台：非零退出 → `[status: completed, exit code: 3]` | 通过 |
-| 后台：完成通知唤醒 | 通过 |
-| 参数互斥：`timeout_ms` + `run_in_background` | 明确报错拒绝 |
-
-## 发布到 npm
-
-**仓库里没有 `NPM_TOKEN`，也没有任何 secrets。** 发布走 [可信发布（OIDC）](https://docs.npmjs.com/trusted-publishers) + [暂存发布](https://docs.npmjs.com/staged-publishing)：CI 把版本提交到暂存队列，你在 npmjs.com 用 2FA 批准才上架。
-
-为什么不再是 token：npm 自 2026-07-31 起，勾了 bypass-2FA 的 granular token 已不能做账号/包设置类敏感操作；[2027-01 起连直接 `npm publish` 也会失去，只剩「读私有包 + 提交暂存」](https://github.blog/changelog/2026-07-31-restricting-npm-bypass-2fa-granular-access-tokens/)。官方给的替代就是这两样，所以流水线一开始就按这个形状建，届时不用改。
-
-**一次性配置**
-
-1. **首次发布**（新包无法先配 Trusted Publisher）：本地 `npm login`（账号需已开 2FA）→ `npm stage publish` → npmjs.com 的「Staged Packages」里用 2FA 批准。这一步之后包才存在。
-2. **npmjs.com → 包 → Settings → Trusted publishing**：GitHub Actions、org `ds-hu`、repo `dsh-plugin-pyrun`、workflow `publish.yml`、Allowed actions 只勾 `npm stage publish`（要用 `direct` 模式才额外勾 `npm publish`）。**配置有 48 小时保鲜期**：建好后 48 小时内必须完成一次成功发布才算绑定，过期只能删了重建——所以放到第一次发版前再建。
-
-**之后每次发版**
-
-```powershell
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-CI 跑测试 → 核对 tag 与 `package.json.version` 一致 → `npm stage publish` → 你在 npmjs.com 批准（2FA）→ 版本上架。想跳过审批就直接发，用 `workflow_dispatch` 选 `direct`。
-
-**要点**
-
-- provenance 自动生成，不用加 `--provenance`：公开仓库 + 公开包，npm 在 OIDC 发布时默认附上。
-- `repository.url` 必须与 GitHub 仓库逐字一致（已指向 `ds-hu/dsh-plugin-pyrun`）；fork 里不改这行，OIDC 校验会拒。
-- 只支持 GitHub 托管 runner；`pull_request_target` / `issue_comment` 事件的 OIDC token 会被 npm 拒绝，所以发布只挂 `push` tag 与 `workflow_dispatch`。
-- workflow 里显式把 npm 升到 11.21+：`npm stage publish` 需要 11.15+，而 node 24 镜像自带哪版 npm 不由你决定。
-- 开始用可信发布后，建议在包设置 → Publishing access 选 **Require two-factor authentication and disallow tokens**，把 token 路径彻底关掉（OIDC 不受这条限制）。
-
-## 开发
-
-- **无构建步骤**：纯 ESM JavaScript（`src/index.js`），没有 `prepare` 脚本，因此不会触发 pnpm 的构建拦截（`allowBuilds`）。
-- **核心包必须声明为 `peerDependencies`**：`@deepseek-ai/dsh-tools`（`defineTool`）与 `@deepseek-ai/dsh-sandbox`（`approveEscalation` 与标记文案）被真实 `import`。写进 `dependencies` 会让**消费方 profile** 把它们安装并提升进 profile 根 `node_modules`，造成第二份物理副本、Symbol 分裂、全进程工具调用崩溃（见上「核心包契约」）；同时它们必须精确锁定在 `devDependencies` 里，否则 `link:` 安装的插件解析不到自己的 `import`。`test/manifest.test.mjs` 是这条规则的常驻断言。
-- **cordis 的两处分工**：`peerDependencies` 声明 `^4.0.1`（非 `dsh-*` 名，不参与版本闸门；运行实例由宿主提供）；`devDependencies` 精确锁定 `4.0.5-alpha.1`——这是 0.2.1-alpha.1 harness 家族自己钉的 cordis（npm dist-tag `dsh-0-2-1-alpha-1`），本地 dev 副本 `dsh-tools` / `dsh-sandbox` 在模块加载时就要 `import { Service } from '@deepseek-ai/cordis'`，而 `link:` 安装路径实际运行的就是这份本地副本，钉齐可避免本地树出现版本漂移。消费方 profile 永不安装 devDependencies，一律按 `package.json` 的 peer 处理。
-- **测试**：`pnpm test`（`node --test "test/*.test.mjs"`）。写 glob 而不是目录：在 CI 上 `node --test test/` 不会展开目录，只会把 `test` 当模块去 `require`，直接 `MODULE_NOT_FOUND`。在本 DSH 沙箱内默认的进程隔离会因 piped-stdio spawn 被拒（`spawn EPERM`，沙箱边界而非测试失败），此时改用 `node --test --test-isolation=none "test/*.test.mjs"` 或 `node test/manifest.test.mjs`。
-- **不依赖 `@deepseek-ai/dsh-llm`**：`HarnessError` 只在 `errorInfo()` 的 `instanceof` 判定里被识别，而进程内插件拿到的是另一份独立拷贝，`instanceof` 必为假——与其静默退化，不如根本不走那条路（取消由运行时的规范通道处理）。
-- **图标**：`icon.svg`（64×64 瓦片，与同机其他第三方插件同形）由 `package.json.icon` 声明，并**必须**同时写进 `files`。Plugins 页经 `exports["./package.json"]` 读清单、把该文件内联成 data URL（`app-boot` 的 `readPluginMeta`：相对路径且留在包目录内，SVG/PNG/JPEG/WebP，≤256 KiB）；少任一半，行上只会显示默认图或一条元信息错误。宿主在启动时读清单，改完要在**重启** `dsh` 后才可见；`github:`/npm 安装还得先重装。`test/manifest.test.mjs` 守着这条链。
-- **改宿主半身 → 重启 `dsh`**；改 `cordis.patch.yml` 可由 `patchReload: live` 生效。
-- **改包名 = 三处同改 + 重装 profile**：`package.json.name`、`cordis.patch.yml` 行的 `name`（Loader 按它 import）、`src/index.js` 的 `export const name`，然后 profile 侧 `remove` 旧名再 `add`，让 `node_modules/@scope/<新名>` 真的存在。漏改不会当场报错：旧的 `node_modules/<旧名>` 链接还在，插件照常启动；等下一次安装按新名物化后，启动只剩一行 `skipping profile bundle "<旧名>"`，插件静默消失。`test/manifest.test.mjs` 把「行名 == 包名 == 导出名」钉成了常驻断言。
-- 重装/更新：重复执行上面的 `dsh plugin --profile web add ...`。
-
-## 已知限制
-
-- **没有 promote-on-timeout（刻意决策）**：内置 `pwsh`/`bash` 工具在前台超时后会把命令转成后台作业继续跑；本工具维持"超时即杀"（`onExpiry: 'kill'`，与历史版本模型可见语义一致，输出 union 不引入 `promoted` 分支），只保留已产出的部分输出。需要长跑的程序直接用 `run_in_background`。
-- **没有 Config**：超时、输出上限一律用执行器的默认值与上限。
-- **与同名工具冲突**：本插件在 web profile 里注册 `python`。重启后不要再激活动态插件 `pyrun-1`（它注册同名工具，且进程内已不存在）。
-- **依赖 PATH 中的 `python`**：插件不探测解释器路径。
-
-## 故障诊断：所有工具调用失败
-
-症状：该进程内**任何**工具调用都失败（不只是 `python`），报 `Cannot read properties of undefined (reading 'prepare')`，栈落在 `dsh-agent-loop` 的 `tool-calls`。重启 `dsh`、删插件、重装都无效。
-
-排查（期望值都写在注释里）：
-
-```powershell
-# 1. 插件是否把核心包物化进了 profile？期望：False（这一份就是元凶）
-Test-Path "$env:USERPROFILE\.dsh\profiles\web\node_modules\@deepseek-ai\dsh-tools"
-# 2. 本仓库那份只应是 devDependency 的惰性副本，且版本与宿主一致
-pnpm why @deepseek-ai/dsh-tools
-# 3. 全机副本清点：profile 侧不应出现，宿主安装树下有且只有一份
-Get-ChildItem "$env:USERPROFILE\.dsh" -Recurse -Directory -Filter 'dsh-tools' -ErrorAction SilentlyContinue
-```
-
-处置：确认清单里它不在 `dependencies`（在就改回 `devDependencies` 并 `pnpm install`）；profile 侧 `dsh plugin --profile web remove @ds-hu/dsh-plugin-pyrun` 再重新 `add`（让 pnpm 重算 profile 的 node_modules）；**完全重启 `dsh`**（`patchReload: live` 不重载已缓存的模块）。
-
-⚠️ **崩溃轮次会毒化会话**：那一轮留下了没有对应 `tool/result` 的孤儿 `tool_calls`，此后该会话每轮都报 `INVALID_REQUEST: ... tool calls need immediate results`；插件修好也救不回来，只能弃用并新建会话。
-
-⚠️ **上游同一缺陷未修**：截至 `0.2.1-alpha.1`，`dsh-tools` 的 `TOOL_RUNTIME_SCHEDULER` 仍是模块局部 `Symbol(...)`（源码 `packages/core/tools/src/index.ts:480`），没有 `Symbol.for` 兜底。升级 harness 换不掉"插件自带副本"这条路径，本插件只能保证自己不再制造副本。
+MIT
