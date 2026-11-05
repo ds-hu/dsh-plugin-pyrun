@@ -11,7 +11,9 @@ takes the whole process down.
 | `src/index.js` | the host half: tool definition, sandbox wiring, job adapter; no build step |
 | `cordis.patch.yml` | the Loader row this package contributes as a bundle layer |
 | `test/manifest.test.mjs` | the manifest contract: peer/dev placement, version gate, row name, icon chain |
+| `test/save-to.test.mjs` | the `save_to` contract: intent forwarding, observation recording, policy fencing, save-before-spawn |
 | `README.md`, `README.zh.md` | user-facing pair, same headings |
+| `CHANGELOG.md` | keep-a-changelog; the `[section]` a release ships lives under its version |
 | `icon.svg` | Plugins-page tile, 64×64 |
 
 ## Runtime contract
@@ -26,7 +28,7 @@ version outright unless an exact-version exemption was granted through
 | What | Version |
 |---|---|
 | Contract basis — what the `devDependencies` copies are pinned to | `0.2.1-alpha.1` (tag `dsh-v0.2.1-alpha.1`) |
-| Running harness on the author's machine, and the one the tool is exercised on daily | `0.2.1-rc.5` (the `python` tool in that session is this plugin, so foreground execution is live-tested) |
+| Running harness on the author's machine, and the one the tool is exercised on daily | `0.2.2-rc.1` (verified with `dsh --version` on 2026-11-05; the `python` tool in that session is this plugin, so foreground execution is live-tested) |
 | Latest upstream as of 2026-11-05 | `0.2.2-rc.1` (tag `dsh-v0.2.2-rc.1`, repo HEAD `fcc0ad46`) |
 | `peerDependencies` range `^0.2.0-rc.1` | admits `0.2.0-rc.1` … `0.2.2-rc.1`, rejects every `0.1.x` |
 
@@ -49,6 +51,40 @@ The 0.2.x call shape this plugin relies on:
 Reference implementation: `packages/shell/tool-pwsh/src/index.ts` (`startJob`). Its private
 helpers are not exported, so `src/index.js` keeps a minimal equivalent (`pythonSources`,
 `pythonJob`).
+
+## `save_to`
+
+One host-side write, and it is not a second filesystem abstraction: the save rides the same
+two seams `dsh-tool-fs` uses. Opting out of either is a bug `test/save-to.test.mjs` catches.
+
+- `ctx.waterfall('fs/write-intent', target, exec, () => undefined)` before writing. With no
+  listener it returns `undefined` and the write is unconditional — today's shipped default:
+  `dsh-base` lists `fs-observation-policy` as `disabled: true` since 0.2.2-alpha.2. A
+  deployment that flips that row on gets the same read-before-write refusal `write` gets, for
+  free, because the intent is forwarded verbatim as `writeText`'s `expected`.
+- `ctx.emit('fs/observed', …)` with the version `writeText` returned, after a successful
+  save. Without it, a session that saves and then `edit`s the file it just created fails
+  `FS_NOT_OBSERVED` ("file has not been read") under an armed policy.
+- `writeText(target, code, expected, signal, policy)` — the fifth argument is the **same
+  per-call policy** the shell request carries (an approved escalation included). Omitting it
+  makes `dsh-fs-sandbox` fall back to the deployment's `process.cwd()` root, which is not
+  necessarily the session workspace.
+- The base directory is `ctx.get('workingDirectory').ensure(agent, signal)`, falling back to the
+  session header cwd — the same resolution `pwsh` and `write` use. The header is immutable, so
+  after a `working_directory` call it still names the project the session was opened in; using it
+  alone would drop a relative `save_to` (and the program) into a directory the model left. The
+  service is optional, so it is read with `ctx.get` rather than added to `inject`.
+- Ordering: the save happens before the spawn and before `jobs.start`, so a refused save never
+  starts a program and a returned background job id means the file is already on disk. The
+  converse does not hold, so a run that throws after a successful save has the path appended to
+  the error instead of being reported as "nothing happened".
+
+Two deliberate omissions: `ctx.get('fs')` rather than `inject: ['fs']`, so a composition
+without a filesystem backend still loads the tool (the call fails with an explicit message
+instead of the whole tool disappearing), and the denial path **edits the caught error's
+message** rather than constructing a new one — the pipeline fills `result.error.info.code` only
+for the `HarnessError` instance the filesystem raised, so a fresh `Error` (or an `FsError` from
+another copy of `dsh-fs`) would silently drop `FS_SANDBOX_DENIED`.
 
 ## Dependency placement
 
@@ -109,8 +145,8 @@ on npmjs.com with 2FA.
 **Every release**
 
 ```powershell
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 CI runs tests, checks the tag against `package.json.version`, stages the publish, and you

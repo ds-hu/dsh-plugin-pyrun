@@ -27,6 +27,7 @@ print(f"你好 {date.today()}")""")
 | Run a snippet | `pwsh` → `python -c "…"` → escape every quote | one `python` call, source verbatim |
 | Run a multi-line script | write a `.py` file, run it, delete it | the same call, no file left behind |
 | Get Chinese output back | GBK mangling on the way home | UTF-8 end to end, emoji included |
+| Keep a program that worked | nothing: copy it out of the transcript by hand | `save_to: 'scripts/report.py'` writes exactly what ran |
 | Run a ten-minute job | the call blocks until the timeout | `run_in_background: true`, collect with `job_output` |
 | Write outside the workspace | denied, no way forward | one-shot `sandbox_permissions` retry with approval |
 
@@ -55,14 +56,21 @@ Every call is one program.
 | Field | What it is for |
 |---|---|
 | `code` | the program, executed verbatim through stdin |
-| `workdir` | working directory; defaults to the session's, and a relative path resolves against it |
+| `workdir` | working directory; defaults to the session's current one, and a relative path resolves against it |
+| `save_to` | save the source to a file before the run; atomic, parent directories created, fenced by the session's file policy |
 | `timeout_ms` | foreground budget; rejected together with a background run |
 | `run_in_background` | returns a job id at once; no timeout applies |
 | `sandbox_permissions` + `justification` | one-shot retry of a call the sandbox just denied |
 
-Output is stdout, then a `[stderr]` section, then markers: `[exit code: N]` (a non-zero
-exit is a result, not a failure), `[timed out after Nms]`, `[killed by signal: …]`,
+Output is stdout, then a `[stderr]` section, then markers: `[saved to <path>]`, `[exit code: N]`
+(a non-zero exit is a result, not a failure), `[timed out after Nms]`, `[killed by signal: …]`,
 `[output truncated; full output: <path>]`, `[sandbox: file access denied under <mode> mode]`.
+
+`save_to` writes through the session filesystem, so the session's file policy decides: refused
+under `read-only`, confined to the workspace under `workspace-write`, and — in a deployment that
+enables the read-before-write policy — refused when the target exists and this session has not
+read it. The save happens before the program starts: a refused save never runs anything, and a
+returned job id means the file is already on disk.
 
 Background jobs appear in `job_list` with kind `python`, are read with `job_output`, and
 stopped with `job_kill`.
@@ -72,6 +80,9 @@ stopped with `job_kill`.
 - A foreground timeout kills the program; it never promotes to a background job. For long
   work, pass `run_in_background` on the first call.
 - The program cannot read interactive input — stdin carries the source.
+- A saved file is not the same execution environment: `python -` runs with `sys.path[0]` at the
+  cwd and `__file__` as `<stdin>`; running the same file from disk later changes both (imports
+  of sibling modules start resolving).
 - No config surface: the executor's own defaults and caps decide timeouts and output limits.
 
 ## More

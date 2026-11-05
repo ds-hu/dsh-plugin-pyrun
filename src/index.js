@@ -139,12 +139,65 @@ function streamText(output) {
   return `${output.text}\n[output truncated; full output: ${output.spillPath ?? '(unavailable)'}]`
 }
 
-/** Resolve an explicit workdir first, making a relative one session-cwd-relative; otherwise use the session cwd. */
-function resolveWorkdir(modelWorkdir, exec) {
-  const headerCwd = exec.agent?.session.header.cwd
-  if (modelWorkdir === undefined) return headerCwd
-  if (headerCwd !== undefined && !isAbsolute(modelWorkdir)) return resolve(headerCwd, modelWorkdir)
+/**
+ * The run's base directory: the session's EFFECTIVE working directory, then the
+ * immutable header cwd. `ctx.workingDirectory.ensure` is what every built-in
+ * path-taking tool resolves against — after a `working_directory` call the
+ * header still names the project the session was opened in, so using it alone
+ * drops a relative `save_to` (and the program) into the wrong directory. The
+ * service stays optional: a composition without it keeps the header fallback.
+ */
+async function sessionBase(ctx, exec) {
+  if (exec.agent === undefined) return undefined
+  const service = ctx.get('workingDirectory')
+  const effective = service === undefined ? undefined : await service.ensure(exec.agent, exec.signal)
+  return effective ?? exec.agent.session.header.cwd
+}
+
+/** Resolve an explicit workdir first, making a relative one base-relative; otherwise use the base. */
+function resolveWorkdir(modelWorkdir, base) {
+  if (modelWorkdir === undefined) return base
+  if (base !== undefined && !isAbsolute(modelWorkdir)) return resolve(base, modelWorkdir)
   return modelWorkdir
+}
+
+/**
+ * Save the source through `ctx.fs` before the program runs.
+ *
+ * The write rides the two seams the built-in `write` tool uses, so it inherits
+ * whatever the deployment decides and adds no policy of its own:
+ * `fs/write-intent` lets an armed observation policy gate a replacement (the
+ * shipped compositions leave that row off), and `fs/observed` records the
+ * version so this session may `edit` the file it just saved without reading it
+ * back. `policy` is this call's resolved sandbox policy, passed as
+ * `writeText`'s fifth argument: omitting it would fall back to the
+ * deployment's `process.cwd()` root, which is not necessarily the session
+ * workspace this run is confined to.
+ */
+async function saveCode(ctx, { code, saveTo, cwd, policy, escalationModes, exec }) {
+  const fs = ctx.get('fs')
+  if (fs === undefined) {
+    throw new Error('save_to is unavailable: this composition mounts no ctx.fs backend')
+  }
+  const target = await fs.resolve(saveTo, { ...cwd !== undefined ? { cwd } : {}, signal: exec.signal })
+  const expected = await ctx.waterfall('fs/write-intent', target, exec, () => undefined)
+  let outcome
+  try {
+    outcome = await fs.writeText(target, code, expected, exec.signal, policy)
+  } catch (error) {
+    if (error?.code !== 'FS_SANDBOX_DENIED') throw error
+    // Same model-facing vocabulary the filesystem tools emit, so the model
+    // recognizes a policy refusal and its one-shot escalation and does not read
+    // it as a program failure. Mutate the provider's own error rather than
+    // replacing it: the pipeline reports `result.error.info.code` only for that
+    // HarnessError instance, and a fresh Error would drop `FS_SANDBOX_DENIED`.
+    const markers = [policy === undefined ? error.message : sandboxDenialMarker(policy.mode)]
+    if (escalationModes.length > 0) markers.push(escalationHintMarker('operation'))
+    error.message = markers.join('\n')
+    throw error
+  }
+  ctx.emit('fs/observed', target, { kind: 'present', version: outcome.version }, exec)
+  return { path: fs.processPath(target), operation: outcome.operation }
 }
 
 /** Detach the executor result from readonly Service Definition types into plain JSON data. */
@@ -176,7 +229,8 @@ function pythonDescription(backgroundEnabled) {
     + '`[sandbox: ...]` markers; retry this exact call once with `sandbox_permissions` (the narrowest '
     + 'wider mode that suffices) plus a `justification` to request wider access through user approval. '
     + 'The program cannot read interactive stdin (stdin carries the source itself). Optional `workdir` '
-    + 'defaults to the session cwd; optional `timeout_ms` defaults to the executor default and is capped '
+    + 'defaults to the session\'s current working directory. Optional `save_to` writes the source to that '
+    + 'path before the program runs. Optional `timeout_ms` defaults to the executor default and is capped '
     + 'by the deployment maximum. The Python exit code is forwarded exactly (`[exit code: N]` marker); '
     + 'non-zero exits are results, not errors. Long output is tail-truncated with the full stream spilled '
     + 'to a file whose path is reported. '
@@ -187,13 +241,26 @@ function pythonDescription(backgroundEnabled) {
     : 'Background execution is not available in this composition; long-running programs must finish within the timeout.')
 }
 
-/** The background branch of the output union: a job id and nothing else. */
+/** The optional `save_to` notice: where the source landed. A fresh spec per use, since two branches mount it. */
+function savedField() {
+  return {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      path: { type: 'string', required: true },
+      operation: { type: 'string', required: true },
+    },
+  }
+}
+
+/** The background branch of the output union: a job id, plus where the source was saved when asked. */
 const BACKGROUND_BRANCH = {
   type: 'object',
   additionalProperties: false,
   properties: {
     kind: { type: 'string', required: true, const: 'background' },
     jobId: { type: 'string', required: true },
+    saved: savedField(),
   },
 }
 
@@ -208,6 +275,7 @@ const FOREGROUND_BRANCH = {
     timedOut: { type: 'boolean', required: true },
     aborted: { type: 'boolean', required: true },
     timeoutMs: { type: 'number', required: true },
+    saved: savedField(),
     stdout: {
       type: 'object',
       additionalProperties: false,
@@ -252,6 +320,7 @@ function renderForeground(value, escalationModes) {
   }
   if (body.length === 0) body = '(python completed with no output)'
   const markers = []
+  if (value.saved !== undefined) markers.push(`[saved to ${value.saved.path}]`)
   if (value.sandbox?.denied) {
     markers.push(sandboxDenialMarker(value.sandbox.mode))
     if (escalationModes.length > 0) markers.push(escalationHintMarker('program'))
@@ -269,6 +338,11 @@ function renderForeground(value, escalationModes) {
 /** Validate the argument constraints a tool schema cannot express. */
 function validatePythonArgs(args) {
   if (args.code.trim().length === 0) throw new Error('invalid code: expected a non-empty string')
+  const invalidSaveTo = args.save_to !== undefined
+    && (typeof args.save_to !== 'string' || args.save_to.trim().length === 0 || args.save_to.includes('\0'))
+  if (invalidSaveTo) {
+    throw new Error(`invalid save_to: expected a non-empty path, got ${JSON.stringify(args.save_to)}`)
+  }
   if (args.timeout_ms !== undefined && (!Number.isFinite(args.timeout_ms) || args.timeout_ms <= 0)) {
     throw new Error(`invalid timeout_ms: expected a positive number, got ${JSON.stringify(args.timeout_ms)}`)
   }
@@ -325,7 +399,11 @@ export function apply(ctx) {
       },
       workdir: {
         type: 'string',
-        description: 'Working directory for the run. Defaults to the session workspace; a relative path is resolved against it.',
+        description: 'Working directory for the run. Defaults to the session\'s current working directory; a relative path is resolved against it.',
+      },
+      save_to: {
+        type: 'string',
+        description: 'Save the source to this path before the program runs. A relative path resolves against `workdir` (or the session cwd). Atomic, creates missing parent directories, and answers to the same sandbox fence and write policy as the built-in `write` tool.',
       },
       timeout_ms: {
         type: 'number',
@@ -357,13 +435,18 @@ export function apply(ctx) {
         return [{
           type: 'text',
           text: value.kind === 'background'
-            ? `started background job ${value.jobId}`
+            ? `started background job ${value.jobId}${value.saved !== undefined ? `; saved to ${value.saved.path}` : ''}`
             : renderForeground(value, escalationModes),
         }]
       },
     },
     async execute(args, exec) {
       validatePythonArgs(args)
+      // Undeclared keys still reach execute, so the schema omission needs its own
+      // guard — ahead of the save, so an unsupported background call leaves no file.
+      if (args.run_in_background === true && jobs === undefined) {
+        throw new Error('background jobs unavailable: load @deepseek-ai/dsh-jobs and @deepseek-ai/dsh-tool-jobs')
+      }
       const standingPolicy = resolveStandingPolicy(exec)
       const approvedMode = args.sandbox_permissions !== undefined && args.justification !== undefined
         ? await approvePythonEscalation(args.sandbox_permissions, args.justification, exec, standingPolicy)
@@ -371,7 +454,20 @@ export function apply(ctx) {
       const policy = approvedMode === undefined
         ? standingPolicy
         : { ...standingPolicy, mode: approvedMode }
-      const workdir = resolveWorkdir(args.workdir, exec)
+      const workdir = resolveWorkdir(args.workdir, await sessionBase(ctx, exec))
+      // Save before anything runs: a refused or failed write leaves the program
+      // unstarted. The converse does not hold — a run that throws after the save
+      // still leaves the file, which is why the catch below names it.
+      const saved = args.save_to === undefined
+        ? undefined
+        : await saveCode(ctx, {
+            code: args.code,
+            saveTo: args.save_to,
+            cwd: workdir,
+            policy,
+            escalationModes,
+            exec,
+          })
       const request = {
         command: PY_CMD,
         ...workdir !== undefined ? { workdir } : {},
@@ -381,38 +477,43 @@ export function apply(ctx) {
         ...args.timeout_ms !== undefined ? { timeoutMs: args.timeout_ms } : {},
         ...policy !== undefined ? { sandboxPolicy: policy } : {},
       }
-      if (args.run_in_background === true) {
-        // Undeclared keys still reach execute, so the schema omission needs its own guard.
-        if (jobs === undefined) {
-          throw new Error('background jobs unavailable: load @deepseek-ai/dsh-jobs and @deepseek-ai/dsh-tool-jobs')
+      try {
+        if (args.run_in_background === true) {
+          if (exec.signal.aborted) throw new Error('tool call aborted')
+          // No deadline arms a background run: `onExpiry: 'none'` leaves the
+          // job's own cancellation as the only way to stop it.
+          const spec = ctx.shell.resolve({ ...request, onExpiry: 'none' })
+          let proc
+          const id = jobs.start({
+            kind: 'python',
+            label: jobLabel(args.code),
+            ...exec.agent !== undefined ? { owner: exec.agent.id } : {},
+            // The registry pumps the observed streams into the job's output ring;
+            // `job_output` renders the deltas (with `[stderr]` sections) itself.
+            output: pythonSources(() => proc),
+            run: () => {
+              // No exec.signal here: cancellation belongs to the job, not to the
+              // tool call that started it. The spawn happens inside this starter,
+              // after the registry admitted the job.
+              const hooks = pythonJob(
+                async (signal) => (proc = await ctx.shell.execute({ ...spec, signal })),
+                started => processOutcome(started, escalationModes),
+              )
+              return { done: hooks.done, cancel: (reason) => hooks.cancel(reason) }
+            },
+          })
+          return { kind: 'background', jobId: id, ...saved !== undefined ? { saved } : {} }
         }
-        if (exec.signal.aborted) throw new Error('tool call aborted')
-        // No deadline arms a background run: `onExpiry: 'none'` leaves the
-        // job's own cancellation as the only way to stop it.
-        const spec = ctx.shell.resolve({ ...request, onExpiry: 'none' })
-        let proc
-        const id = jobs.start({
-          kind: 'python',
-          label: jobLabel(args.code),
-          ...exec.agent !== undefined ? { owner: exec.agent.id } : {},
-          // The registry pumps the observed streams into the job's output ring;
-          // `job_output` renders the deltas (with `[stderr]` sections) itself.
-          output: pythonSources(() => proc),
-          run: () => {
-            // No exec.signal here: cancellation belongs to the job, not to the
-            // tool call that started it. The spawn happens inside this starter,
-            // after the registry admitted the job.
-            const hooks = pythonJob(
-              async (signal) => (proc = await ctx.shell.execute({ ...spec, signal })),
-              started => processOutcome(started, escalationModes),
-            )
-            return { done: hooks.done, cancel: (reason) => hooks.cancel(reason) }
-          },
-        })
-        return { kind: 'background', jobId: id }
+        const execution = await ctx.shell.execute(ctx.shell.resolve({ ...request, signal: exec.signal }))
+        return { ...canonicalResult(await execution.result()), ...saved !== undefined ? { saved } : {} }
+      } catch (error) {
+        // Annotate rather than replace: the pipeline reports a structured code
+        // only for the HarnessError instance a throwing subsystem raised.
+        if (saved !== undefined && error instanceof Error) {
+          error.message = `${error.message}\n[saved to ${saved.path}]`
+        }
+        throw error
       }
-      const execution = await ctx.shell.execute(ctx.shell.resolve({ ...request, signal: exec.signal }))
-      return canonicalResult(await execution.result())
     },
     presentCall(args) {
       return args.run_in_background === true
